@@ -1,0 +1,781 @@
+<DOCTYPE html>
+import React, { useState, useEffect } from 'react'; // Import useEffect
+
+// Conversion constant: 1 Nautical Mile = 1.852 Kilometers
+const NM_TO_KM = 1.852;
+// Safety margin for landing altitude in feet
+const SAFETY_MARGIN_FT = 500;
+// A small epsilon for floating point comparisons to prevent infinite loops due to tiny remainders
+const EPSILON = 1e-9;
+
+
+// Helper function for linear interpolation
+// x: value to interpolate at
+// x0, y0: first data point (x-coordinate, y-coordinate)
+// x1, y1: second data point (x-coordinate, y-coordinate)
+const linearInterpolate = (x, x0, y0, x1, y1) => {
+    // If the data points are the same, return the value at y0 to avoid division by zero
+    if (x0 === x1) return y0;
+    // Clamp x within the range [x0, x1] to prevent extrapolation beyond known data points
+    if (x <= x0) return y0;
+    if (x >= x1) return y1;
+    // Perform linear interpolation
+    return y0 + (x - x0) * (y1 - y0) / (x1 - x0);
+};
+
+// Helper function for interpolating angles (wind direction)
+// It finds the shortest path between angles to avoid issues when crossing 0/360 degrees
+const interpolateAngle = (currentAltitudeKft, alt0Kft, angle0, alt1Kft, angle1) => {
+    // If altitudes are the same, return the first angle
+    if (alt0Kft === alt1Kft) return angle0;
+    // Clamp currentAltitudeKft within the range [alt0Kft, alt1Kft]
+    if (currentAltitudeKft <= alt0Kft) return angle0;
+    if (currentAltitudeKft >= alt1Kft) return angle1;
+
+    // Calculate the difference between angles, adjusting for the shortest path (e.g., 350 to 10 is 20, not -340)
+    let diff = angle1 - angle0;
+    if (diff > 180) diff -= 360;
+    if (diff < -180) diff += 360;
+
+    // Interpolate the angle
+    const interpolated = angle0 + diff * ((currentAltitudeKft - alt0Kft) / (alt1Kft - alt0Kft));
+    // Normalize the result to be between 0 and 360 degrees
+    return (interpolated + 360) % 360;
+};
+
+// Helper function to convert degrees (aviation: 0=N, 90=E, clockwise) to radians for SVG (0=top, clockwise)
+// For SVG, typically 0 degrees is positive X-axis, increasing counter-clockwise.
+// To make 0 degrees aviation (North) point upwards in SVG (negative Y-axis),
+// we convert aviation degrees (clockwise from North) to mathematical radians (counter-clockwise from East).
+// Then adjust so 0 degrees aviation is at the top (negative Y axis in SVG).
+const toRadiansForSVG = (degrees) => {
+    // Convert aviation degrees to standard mathematical degrees (0=East, 90=North, counter-clockwise)
+    // Then convert to radians, and adjust so 0 (North) is at the top of the circle (-90 degrees or 270 degrees in math radians)
+    return toRadians(degrees - 90); // Subtract 90 to rotate North (0) to the top (-Y axis)
+};
+const toRadians = (degrees) => degrees * Math.PI / 180;
+
+
+// Helper function to simulate flight for a given speed and direction
+const simulateFlight = (
+    testSpeed,
+    currentTestFlightDirection, // The specific flight direction for this simulation
+    initialAltitude,
+    groundAltitude,
+    batteryTime,
+    sortedSpeedRoDPairs,
+    sortedWindLayers
+) => {
+    let simulationCurrentAltitude = initialAltitude;
+    let simulationTimeElapsed = 0;
+    let simulationDistanceNM = 0; // Distance is calculated in Nautical Miles internally
+
+    // Calculate the effective final landing altitude including the safety margin
+    const effectiveGroundAltitude = groundAltitude + SAFETY_MARGIN_FT; // Apply safety margin here
+
+    // Get interpolated Rate of Descent for the current testSpeed
+    let interpolatedRoD;
+    let lowerRoD = sortedSpeedRoDPairs[0];
+    let upperRoD = sortedSpeedRoDPairs[sortedSpeedRoDPairs.length - 1];
+
+    if (testSpeed <= lowerRoD.speed) {
+        interpolatedRoD = lowerRoD.rod;
+    } else if (testSpeed >= upperRoD.speed) {
+        interpolatedRoD = upperRoD.rod;
+    } else {
+        // Find the correct segment for interpolation
+        for (let k = 0; k < sortedSpeedRoDPairs.length - 1; k++) {
+            if (testSpeed >= sortedSpeedRoDPairs[k].speed && testSpeed <= sortedSpeedRoDPairs[k+1].speed) {
+                lowerRoD = sortedSpeedRoDPairs[k];
+                upperRoD = sortedSpeedRoDPairs[k+1];
+                break;
+            }
+        }
+        interpolatedRoD = linearInterpolate(testSpeed, lowerRoD.speed, lowerRoD.rod, upperRoD.speed, upperRoD.rod);
+    }
+
+    // If RoD is non-positive, flight cannot occur, return zero distance and time
+    if (interpolatedRoD <= 0) {
+        return { distance: 0, time: 0 };
+    }
+
+    // Simulate the flight minute-by-minute
+    while (true) {
+        // Calculate time until hitting effective ground (groundAltitude + safety margin) or battery limit
+        const timeToGround = (simulationCurrentAltitude - effectiveGroundAltitude) / interpolatedRoD; // Use effectiveGroundAltitude
+        const timeToBatteryLimit = batteryTime - simulationTimeElapsed;
+
+        // Determine the actual time step for this iteration (minimum of 1 minute, time to ground, or time to battery limit)
+        let timeStep = Math.min(1, timeToGround, timeToBatteryLimit);
+        if (timeStep <= EPSILON) break; // Break if time step is negligible, implying end of flight
+
+        // Calculate average altitude for wind interpolation during this time step
+        // This provides a more accurate wind profile for the segment
+        const altitudeForWind = Math.max(effectiveGroundAltitude, simulationCurrentAltitude - (interpolatedRoD * timeStep / 2)); // Use effectiveGroundAltitude for lower bound
+        const altKftForWind = altitudeForWind / 1000; // Convert feet to thousands of feet for wind layers
+
+        // Get interpolated Wind Speed and Direction for the current altitude
+        let windSpeedAtAltitude = 0;
+        let windDirectionAtAltitude = 0;
+
+        if (sortedWindLayers.length === 1) {
+            // If only one wind layer, use its values directly
+            windSpeedAtAltitude = sortedWindLayers[0].speed;
+            windDirectionAtAltitude = sortedWindLayers[0].direction;
+        } else {
+            // Find the correct wind layer segment for interpolation
+            let lowerWind = sortedWindLayers[0];
+            let upperWind = sortedWindLayers[sortedWindLayers.length - 1];
+
+            if (altKftForWind <= lowerWind.altitudeKft) {
+                windSpeedAtAltitude = lowerWind.speed;
+                windDirectionAtAltitude = lowerWind.direction;
+            } else if (altKftForWind >= upperWind.altitudeKft) {
+                windSpeedAtAltitude = upperWind.speed;
+                windDirectionAtAltitude = upperWind.direction;
+            } else {
+                for (let k = 0; k < sortedWindLayers.length - 1; k++) {
+                    if (altKftForWind >= sortedWindLayers[k].altitudeKft && altKftForWind <= sortedWindLayers[k+1].altitudeKft) {
+                        lowerWind = sortedWindLayers[k];
+                        upperWind = sortedWindLayers[k+1];
+                        break;
+                    }
+                }
+                windSpeedAtAltitude = linearInterpolate(altKftForWind, lowerWind.altitudeKft, lowerWind.speed, upperWind.altitudeKft, upperWind.speed);
+                windDirectionAtAltitude = interpolateAngle(altKftForWind, lowerWind.altitudeKft, lowerWind.direction, upperWind.altitudeKft, upperWind.direction);
+            }
+        }
+
+        // --- VECTOR MATH FOR GROUND SPEED ---
+        // IMPORTANT: Wind direction is where the wind is COMING FROM.
+        // To get the direction the wind is GOING TO (for vector addition), add 180 degrees.
+        const windGoesToDirection = (windDirectionAtAltitude + 180) % 360;
+
+        // Convert aviation degrees (0=N, 90=E, clockwise) to standard mathematical radians (0=E, 90=N, counter-clockwise)
+        const windAngleRad = toRadians((90 - windGoesToDirection + 360) % 360);
+        const flightAngleRad = toRadians((90 - currentTestFlightDirection + 360) % 360);
+
+        // Calculate airspeed vector components (aircraft's intended heading)
+        const airVx = testSpeed * Math.cos(flightAngleRad);
+        const airVy = testSpeed * Math.sin(flightAngleRad);
+
+        // Calculate wind vector components
+        const windVx = windSpeedAtAltitude * Math.cos(windAngleRad);
+        const windVy = windSpeedAtAltitude * Math.sin(windAngleRad);
+
+        // Calculate ground speed vector components (Airspeed vector + Wind vector)
+        const groundVx = airVx + windVx;
+        const groundVy = airVy + windVy;
+
+        // Calculate the magnitude of the ground speed vector
+        const groundSpeed = Math.sqrt(groundVx * groundVx + groundVy * groundVy);
+
+        // Calculate horizontal distance covered during this time step (in Nautical Miles)
+        // (Speed in knots / 60 minutes per hour) * timeStep in minutes
+        simulationDistanceNM += groundSpeed * (timeStep / 60);
+
+        // Update current altitude and elapsed time
+        simulationCurrentAltitude -= interpolatedRoD * timeStep;
+        simulationTimeElapsed += timeStep;
+
+        // Break the loop if the aircraft has reached or gone below effective ground, or battery time limit is met
+        if (simulationCurrentAltitude <= effectiveGroundAltitude || simulationTimeElapsed >= batteryTime) { // Use effectiveGroundAltitude
+            break;
+        }
+    }
+    // Return distance in NM and elapsed time
+    return { distance: simulationDistanceNM, time: simulationTimeElapsed };
+};
+
+const App = () => {
+    // State variables for user inputs
+    const [initialAltitude, setInitialAltitude] = useState(10000); // Initial aircraft altitude in feet
+    const [groundAltitude, setGroundAltitude] = useState(0); // Ground altitude in feet
+    const [batteryTime, setBatteryTime] = useState(20); // Maximum flight time due to battery in minutes
+    const [desiredFlightDirection, setDesiredFlightDirection] = useState(0); // User-specified flight direction in degrees
+    // Array of objects for Speed (IAS in knots) vs. Rate of Descent (ft/min) pairs
+    const [speedRoDPairs, setSpeedRoDPairs] = useState([
+        { speed: 52, rod: 400 },
+        { speed: 75, rod: 1200 }
+    ]);
+    // Array of objects for wind layers (altitude in kft, speed in knots, direction in degrees from North)
+    const [windLayers, setWindLayers] = useState([
+        { altitudeKft: 0, speed: 5, direction: 90 },
+        { altitudeKft: 5, speed: 10, direction: 120 },
+        { altitudeKft: 10, speed: 15, direction: 150 }
+    ]);
+
+    // State variables for calculation results
+    const [polarResults, setPolarResults] = useState([]); // Results for the spider graph: {direction, distance (km), speed, time}
+    const [specificDirectionResult, setSpecificDirectionResult] = useState(null); // Result for the user-entered flight direction
+    const [isLoading, setIsLoading] = useState(false); // Loading state for calculations
+    const [error, setError] = useState(''); // Error message display
+
+    // Calculate on initial load
+    useEffect(() => {
+        calculateGlideDistance();
+    }, []); // Empty dependency array means this runs once on mount
+
+    // Function to add a new Speed/RoD pair input row
+    const addSpeedRoDPair = () => {
+        setSpeedRoDPairs([...speedRoDPairs, { speed: 0, rod: 0 }]);
+    };
+
+    // Function to update a specific Speed or RoD value in a pair
+    const updateSpeedRoDPair = (index, field, value) => {
+        const newPairs = [...speedRoDPairs];
+        newPairs[index][field] = parseFloat(value);
+        setSpeedRoDPairs(newPairs);
+    };
+
+    // Function to remove a Speed/RoD pair input row
+    const removeSpeedRoDPair = (index) => {
+        const newPairs = speedRoDPairs.filter((_, i) => i !== index);
+        setSpeedRoDPairs(newPairs);
+    };
+
+    // Function to add a new Wind Layer input row
+    const addWindLayer = () => {
+        setWindLayers([...windLayers, { altitudeKft: 0, speed: 0, direction: 0 }]);
+    };
+
+    // Function to update a specific altitude, speed, or direction in a wind layer
+    const updateWindLayer = (index, field, value) => {
+        const newLayers = [...windLayers];
+        newLayers[index][field] = parseFloat(value);
+        setWindLayers(newLayers);
+    };
+
+    // Function to remove a Wind Layer input row
+    const removeWindLayer = (index) => {
+        const newLayers = windLayers.filter((_, i) => i !== index);
+        setWindLayers(newLayers);
+    };
+
+    // Main function to calculate the glide distance and generate polar results
+    const calculateGlideDistance = () => {
+        setError(''); // Clear previous errors
+        setIsLoading(true); // Set loading state
+
+        try { // Added try-catch for robust error handling
+            // --- Input Validation ---
+            // Validate that initial altitude is greater than ground altitude plus safety margin
+            if (initialAltitude <= (groundAltitude + SAFETY_MARGIN_FT)) {
+                throw new Error(`Initial altitude (${initialAltitude} ft) must be greater than ground altitude plus the safety margin (${groundAltitude + SAFETY_MARGIN_FT} ft).`);
+            }
+            if (speedRoDPairs.length < 2) {
+                throw new Error('Please provide at least two Speed/Rate of Descent pairs for interpolation.');
+            }
+            if (windLayers.length < 1) {
+                throw new Error('Please provide at least one Wind Layer.');
+            }
+            if (batteryTime <= 0) {
+                throw new Error('Battery time must be positive.');
+            }
+            if (speedRoDPairs.some(p => isNaN(p.speed) || isNaN(p.rod) || p.speed < 0 || p.rod < 0)) {
+                throw new Error('All speed and rate of descent values must be non-negative numbers.');
+            }
+            if (speedRoDPairs.some(p => p.rod === 0 && p.speed > 0)) {
+                 throw new Error('Rate of Descent cannot be zero for a non-zero speed. Please enter a positive value.');
+            }
+            if (windLayers.some(w => isNaN(w.altitudeKft) || isNaN(w.speed) || isNaN(w.direction) || w.altitudeKft < 0 || w.speed < 0 || w.direction < 0 || w.direction > 360)) {
+                throw new Error('All wind layer values (altitude, speed, direction) must be valid numbers. Altitude and speed must be non-negative, direction between 0-360.');
+            }
+            // Ensure that speedRoDPairs does not have identical speeds, which would break interpolation
+            const uniqueSpeeds = new Set(speedRoDPairs.map(p => p.speed));
+            if (uniqueSpeeds.size !== speedRoDPairs.length) {
+                throw new Error('Speed values in "Speed vs. Rate of Descent" pairs must be unique.');
+            }
+            // Ensure that windLayers does not have identical altitudes, which would break interpolation
+            const uniqueAltitudes = new Set(windLayers.map(w => w.altitudeKft));
+            if (uniqueAltitudes.size !== windLayers.length) {
+                throw new Error('Altitude values in "Wind Layers" must be unique.');
+            }
+
+            // Sort input data for correct interpolation
+            // Speed/RoD pairs sorted by speed in ascending order
+            const sortedSpeedRoDPairs = [...speedRoDPairs].sort((a, b) => a.speed - b.speed);
+            // Wind layers sorted by altitude in ascending order
+            const sortedWindLayers = [...windLayers].sort((a, b) => a.altitudeKft - b.altitudeKft);
+
+            const currentPolarResults = []; // Temporary array to build the polar results for the spider graph
+
+            // Define a range of speeds to test for optimal performance for each direction
+            const minSpeed = sortedSpeedRoDPairs[0].speed;
+            const maxSpeed = sortedSpeedRoDPairs[sortedSpeedRoDPairs.length - 1].speed;
+            // Test 100 different speeds across the range for a good approximation
+            const speedIncrement = (maxSpeed - minSpeed) / 100;
+
+            // Iterate through all possible flight directions (0 to 330 degrees in 30-degree steps for the graph)
+            for (let currentTestFlightDirection = 0; currentTestFlightDirection < 360; currentTestFlightDirection += 30) {
+                let bestDistanceForCurrentDirectionNM = 0;
+                let optimalSpeedForCurrentDirection = null;
+                let actualTimeForCurrentDirection = null;
+
+                // For each direction, iterate through the range of speeds to find the best speed for THIS direction
+                for (let i = 0; i <= 100; i++) {
+                    const testSpeed = minSpeed + i * speedIncrement;
+                    if (testSpeed <= 0) continue; // Skip non-positive speeds
+
+                    const { distance: simulationDistanceNM, time: simulationTimeElapsed } = simulateFlight(
+                        testSpeed,
+                        currentTestFlightDirection,
+                        initialAltitude,
+                        groundAltitude,
+                        batteryTime,
+                        sortedSpeedRoDPairs,
+                        sortedWindLayers
+                    );
+
+                    // If this speed yields a better distance for the current direction
+                    if (simulationDistanceNM > bestDistanceForCurrentDirectionNM) {
+                        bestDistanceForCurrentDirectionNM = simulationDistanceNM;
+                        optimalSpeedForCurrentDirection = testSpeed;
+                        actualTimeForCurrentDirection = simulationTimeElapsed;
+                    }
+                } // End of speed loop for current direction
+
+                // Add the best result for this direction to the polar results array (convert to KM for display)
+                if (optimalSpeedForCurrentDirection !== null) { // Only add if a valid flight path was found
+                    currentPolarResults.push({
+                        direction: currentTestFlightDirection,
+                        distance: bestDistanceForCurrentDirectionNM * NM_TO_KM, // Convert to KM for graph data
+                        speed: optimalSpeedForCurrentDirection,
+                        time: actualTimeForCurrentDirection
+                    });
+                }
+            } // End of direction loop for graph
+
+            // Calculate specifically for the desired flight direction input by the user
+            let bestDistanceForDesiredDirectionNM = 0;
+            let optimalSpeedForDesiredDirection = null;
+            let actualTimeForDesiredDirection = null;
+
+            for (let i = 0; i <= 100; i++) {
+                const testSpeed = minSpeed + i * speedIncrement;
+                if (testSpeed <= 0) continue;
+
+                const { distance: simulationDistanceNM, time: simulationTimeElapsed } = simulateFlight(
+                    testSpeed,
+                    desiredFlightDirection, // Use the user's specific desired flight direction
+                    initialAltitude,
+                    groundAltitude,
+                    batteryTime,
+                    sortedSpeedRoDPairs,
+                    sortedWindLayers
+                );
+
+                if (simulationDistanceNM > bestDistanceForDesiredDirectionNM) {
+                    bestDistanceForDesiredDirectionNM = simulationDistanceNM;
+                    optimalSpeedForDesiredDirection = testSpeed;
+                    actualTimeForDesiredDirection = simulationTimeElapsed;
+                }
+            }
+
+            // Set the result for the specific desired direction (convert to KM for display)
+            setSpecificDirectionResult({
+                direction: desiredFlightDirection,
+                distance: bestDistanceForDesiredDirectionNM * NM_TO_KM, // Convert to KM
+                speed: optimalSpeedForDesiredDirection,
+                time: actualTimeForDesiredDirection
+            });
+
+            // Set the final polar results for the spider graph
+            setPolarResults(currentPolarResults);
+        } catch (e) {
+            setError(e.message); // Set error message from the thrown error
+        } finally {
+            setIsLoading(false); // End loading state in all cases
+        }
+    };
+
+    // SpiderGraph Component to visualize the polar results
+    const SpiderGraph = ({ data, desiredFlightDirection }) => { // Pass desiredFlightDirection as a prop
+        if (!data || data.length === 0) {
+            return (
+                <div className="flex justify-center items-center mt-8 p-6 bg-gray-50 rounded-lg shadow-inner">
+                    <p className="text-gray-600">No data available for the spider graph. Please calculate first.</p>
+                </div>
+            );
+        }
+
+        const size = 380; // SVG size
+        const padding = 50; // Padding to ensure labels fit
+        const radius = (size / 2) - padding; // Max radius for the graph
+        const centerX = size / 2;
+        const centerY = size / 2;
+
+        // Find the maximum distance in the data to scale the graph (distances are already in KM)
+        // Add safeguard: if maxDistance is 0, set scaleFactor to 0 to prevent division by zero
+        const maxDistance = Math.max(...data.map(d => d.distance));
+        const scaleFactor = maxDistance > 0 ? radius / maxDistance : 0; // FIX applied here
+
+        // Number of concentric circles (grid lines)
+        const numCircles = 5;
+        const circleInterval = radius / numCircles;
+
+        // Azimuth degrees to label (0, 30, 60, ..., 330)
+        const azimuthDegrees = Array.from({ length: 12 }, (_, i) => i * 30); // 0, 30, 60, ..., 330
+        const outerRadiusForLabels = radius + 25; // Slightly outside the graph for azimuth labels
+
+        return (
+            <div className="flex justify-center mt-8">
+                <svg width={size} height={size} viewBox={`0 0 ${size} ${size}`} className="bg-white rounded-lg shadow-md">
+                    {/* Concentric circles (grid) */}
+                    {[...Array(numCircles).keys()].map(i => {
+                        const r = (i + 1) * circleInterval;
+                        return (
+                            <circle
+                                key={`circle-${i}`}
+                                cx={centerX}
+                                cy={centerY}
+                                r={r}
+                                fill="none"
+                                stroke="#e0e0e0"
+                                strokeWidth="1"
+                            />
+                        );
+                    })}
+                    {/* Circle labels (distance scale) */}
+                    {[...Array(numCircles).keys()].map(i => {
+                        const r = (i + 1) * circleInterval;
+                        const labelValue = ((i + 1) * maxDistance / numCircles).toFixed(0);
+                        return (
+                            <text
+                                key={`circle-label-${i}`}
+                                x={centerX + 5}
+                                y={centerY - r - 5}
+                                textAnchor="start"
+                                fontSize="10"
+                                fill="#777"
+                            >
+                                {labelValue} km {/* Label displays in kilometers */}
+                            </text>
+                        );
+                    })}
+
+                    {/* Radial lines (axes) for every 30 degrees based on data points */}
+                    {azimuthDegrees.map((angleDeg, index) => {
+                        const angleRad = toRadiansForSVG(angleDeg); // Use new conversion for SVG
+                        const x2 = centerX + radius * Math.cos(angleRad);
+                        const y2 = centerY + radius * Math.sin(angleRad);
+                        return (
+                            <line
+                                key={`axis-line-${index}`}
+                                x1={centerX} y1={centerY} x2={x2} y2={y2}
+                                stroke="#e0e0e0"
+                                strokeWidth="1"
+                            />
+                        );
+                    })}
+
+                    {/* Azimuth labels (degrees) outside the graph */}
+                    {azimuthDegrees.map((azimuthDeg, index) => {
+                        const angleRad = toRadiansForSVG(azimuthDeg); // Use new conversion for SVG labels
+                        const x = centerX + outerRadiusForLabels * Math.cos(angleRad);
+                        const y = centerY + outerRadiusForLabels * Math.sin(angleRad) + 5; // +5 for vertical alignment
+                        return (
+                            <text
+                                key={`azimuth-label-${index}`}
+                                x={x}
+                                y={y}
+                                textAnchor="middle"
+                                fontSize="12"
+                                fill="#555"
+                                fontWeight="bold"
+                            >
+                                {azimuthDeg}°
+                            </text>
+                        );
+                    })}
+
+                    {/* Data polygon (glide distance contour) */}
+                    <polygon
+                        points={data.map(point => {
+                            const angleRad = toRadiansForSVG(point.direction); // Use new conversion for SVG
+                            const r = point.distance * scaleFactor; // distance is already in KM
+                            const x = centerX + r * Math.cos(angleRad);
+                            const y = centerY + r * Math.sin(angleRad);
+                            return `${x},${y}`;
+                        }).join(' ')}
+                        fill="rgba(79, 70, 229, 0.4)" // Indigo-500 with transparency
+                        stroke="rgb(79, 70, 229)" // Indigo-500
+                        strokeWidth="2"
+                    />
+
+                    {/* Data points and labels (distance and optimal speed) */}
+                    {data.map((point, index) => {
+                        const angleRad = toRadiansForSVG(point.direction); // Use new conversion for SVG
+                        const r = point.distance * scaleFactor; // distance is already in KM
+                        const x = centerX + r * Math.cos(angleRad);
+                        const y = centerY + r * Math.sin(angleRad);
+
+                        return (
+                            <g key={`data-point-${index}`}>
+                                <circle
+                                    cx={x}
+                                    cy={y}
+                                    r="4"
+                                    fill="rgb(79, 70, 229)" // Indigo-500
+                                    stroke="white"
+                                    strokeWidth="1.5"
+                                />
+                                {/* Text label for distance and speed (displays in kilometers) */}
+                                <text
+                                    x={x}
+                                    y={y - 8} // Position slightly above the point
+                                    textAnchor="middle"
+                                    fontSize="10"
+                                    fill="#333"
+                                >
+                                    {point.distance.toFixed(0)} km ({point.speed.toFixed(0)} kts) {/* Label displays in kilometers */}
+                                </text>
+                            </g>
+                        );
+                    })}
+
+                    {/* Line for desired flight direction */}
+                    {desiredFlightDirection !== undefined && desiredFlightDirection !== null && !isNaN(desiredFlightDirection) && (
+                        (() => {
+                            const lineAngleRad = toRadiansForSVG(desiredFlightDirection);
+                            const lineX = centerX + radius * Math.cos(lineAngleRad);
+                            const lineY = centerY + radius * Math.sin(lineAngleRad);
+                            return (
+                                <line
+                                    x1={centerX}
+                                    y1={centerY}
+                                    x2={lineX}
+                                    y2={lineY}
+                                    stroke="rgb(220, 38, 38)" // Red-600
+                                    strokeWidth="3"
+                                    strokeDasharray="5,5" // Dashed line
+                                />
+                            );
+                        })()
+                    )}
+                </svg>
+            </div>
+        );
+    };
+
+    return (
+        // Main container with responsive styling using Tailwind CSS
+        <div className="min-h-screen bg-gray-100 p-4 sm:p-6 lg:p-8 flex items-center justify-center font-sans">
+            <div className="bg-white p-6 sm:p-8 rounded-lg shadow-xl w-full max-w-4xl">
+                <h1 className="text-3xl sm:text-4xl font-bold text-center text-gray-800 mb-6">Glide Distance Calculator</h1>
+
+                {/* Error message display */}
+                {error && (
+                    <div className="bg-red-100 border border-red-400 text-red-700 px-4 py-3 rounded relative mb-4" role="alert">
+                        <strong className="font-bold">Error:</strong>
+                        <span className="block sm:inline ml-2">{error}</span>
+                    </div>
+                )}
+
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-6 mb-8">
+                    {/* Section for Initial Flight Conditions */}
+                    <div className="bg-gray-50 p-4 rounded-lg shadow-sm">
+                        <h2 className="text-xl font-semibold text-gray-700 mb-4">Initial Flight Conditions</h2>
+                        <div className="mb-4">
+                            <label htmlFor="initialAltitude" className="block text-sm font-medium text-gray-700">Initial Altitude (ft)</label>
+                            <input
+                                type="number"
+                                id="initialAltitude"
+                                value={initialAltitude}
+                                onChange={(e) => setInitialAltitude(parseFloat(e.target.value))}
+                                className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 sm:text-sm p-2"
+                                min="0" // Minimum value for altitude
+                            />
+                        </div>
+                        <div className="mb-4">
+                            <label htmlFor="groundAltitude" className="block text-sm font-medium text-gray-700">Ground Altitude (ft)</label>
+                            <input
+                                type="number"
+                                id="groundAltitude"
+                                value={groundAltitude}
+                                onChange={(e) => setGroundAltitude(parseFloat(e.target.value))}
+                                className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 sm:text-sm p-2"
+                                min="0" // Minimum value for altitude
+                            />
+                        </div>
+                        <div className="mb-4">
+                            <label htmlFor="batteryTime" className="block text-sm font-medium text-gray-700">Battery Time (minutes)</label>
+                            <input
+                                type="number"
+                                id="batteryTime"
+                                value={batteryTime}
+                                onChange={(e) => setBatteryTime(parseFloat(e.target.value))}
+                                className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 sm:text-sm p-2"
+                                min="1" // Minimum value for battery time
+                            />
+                        </div>
+                        <div>
+                            <label htmlFor="desiredFlightDirection" className="block text-sm font-medium text-gray-700">Specific Flight Direction (degrees True)</label>
+                            <input
+                                type="number"
+                                id="desiredFlightDirection"
+                                value={desiredFlightDirection}
+                                onChange={(e) => setDesiredFlightDirection(parseFloat(e.target.value))}
+                                className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 sm:text-sm p-2"
+                                min="0"
+                                max="360"
+                            />
+                        </div>
+                    </div>
+
+                    {/* Section for Speed (IAS) vs. Rate of Descent Pairs */}
+                    <div className="bg-gray-50 p-4 rounded-lg shadow-sm">
+                        <h2 className="text-xl font-semibold text-gray-700 mb-4">Speed (IAS) vs. Rate of Descent</h2>
+                        {speedRoDPairs.map((pair, index) => (
+                            <div key={index} className="flex items-end space-x-2 mb-2">
+                                <div className="flex-1">
+                                    <label htmlFor={`speed-${index}`} className="block text-xs font-medium text-gray-600">Speed (knots)</label>
+                                    <input
+                                        type="number"
+                                        id={`speed-${index}`}
+                                        value={pair.speed}
+                                        onChange={(e) => updateSpeedRoDPair(index, 'speed', e.target.value)}
+                                        className="mt-1 block w-full rounded-md border-gray-300 shadow-sm sm:text-sm p-2"
+                                        min="0"
+                                    />
+                                </div>
+                                <div className="flex-1">
+                                    <label htmlFor={`rod-${index}`} className="block text-xs font-medium text-gray-600">RoD (ft/min)</label>
+                                    <input
+                                        type="number"
+                                        id={`rod-${index}`}
+                                        value={pair.rod}
+                                        onChange={(e) => updateSpeedRoDPair(index, 'rod', e.target.value)}
+                                        className="mt-1 block w-full rounded-md border-gray-300 shadow-sm sm:text-sm p-2"
+                                        min="0"
+                                    />
+                                </div>
+                                {/* Button to remove a pair */}
+                                <button
+                                    onClick={() => removeSpeedRoDPair(index)}
+                                    className="p-2 bg-red-500 text-white rounded-md hover:bg-red-600 focus:outline-none focus:ring-2 focus:ring-red-500 focus:ring-offset-2"
+                                >
+                                    {/* SVG icon for delete */}
+                                    <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor">
+                                        <path fillRule="evenodd" d="M9 2a1 1 0 00-.894.553L7.382 4H4a1 1 0 000 2v10a2 2 0 002 2h8a2 2 0 002-2V6a1 1 0 100-2h-3.382l-.724-1.447A1 1 0 0011 2H9zM7 8a1 1 0 011-1h4a1 1 0 110 2H8a1 1 0 01-1-1zm2 5a1 1 0 011-1h0a1 1 0 110 2h0a1 1 0 01-1-1z" clipRule="evenodd" />
+                                    </svg>
+                                </button>
+                            </div>
+                        ))}
+                        {/* Button to add a new speed/RoD pair */}
+                        <button
+                            onClick={addSpeedRoDPair}
+                            className="w-full bg-indigo-600 text-white py-2 px-4 rounded-md hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:ring-offset-2 mt-4"
+                        >
+                            Add Speed/RoD Pair
+                        </button>
+                    </div>
+                </div>
+
+                {/* Section for Wind Layers */}
+                <div className="bg-gray-50 p-4 rounded-lg shadow-sm mb-8">
+                    <h2 className="text-xl font-semibold text-gray-700 mb-4">Wind Layers (per 1000 ft altitude)</h2>
+                    {windLayers.map((layer, index) => (
+                        <div key={index} className="flex items-end space-x-2 mb-2">
+                            <div className="flex-1">
+                                <label htmlFor={`wind-alt-${index}`} className="block text-xs font-medium text-gray-600">Altitude (kft)</label>
+                                <input
+                                    type="number"
+                                    id={`wind-alt-${index}`}
+                                    value={layer.altitudeKft}
+                                    onChange={(e) => updateWindLayer(index, 'altitudeKft', e.target.value)}
+                                    className="mt-1 block w-full rounded-md border-gray-300 shadow-sm sm:text-sm p-2"
+                                    min="0"
+                                />
+                            </div>
+                            <div className="flex-1">
+                                <label htmlFor={`wind-speed-${index}`} className="block text-xs font-medium text-gray-600">Speed (knots)</label>
+                                <input
+                                    type="number"
+                                    id={`wind-speed-${index}`}
+                                    value={layer.speed}
+                                    onChange={(e) => updateWindLayer(index, 'speed', e.target.value)}
+                                    className="mt-1 block w-full rounded-md border-gray-300 shadow-sm sm:text-sm p-2"
+                                    min="0"
+                                />
+                            </div>
+                            <div className="flex-1">
+                                <label htmlFor={`wind-dir-${index}`} className="block text-xs font-medium text-gray-600">Direction (degrees)</label>
+                                <input
+                                    type="number"
+                                    id={`wind-dir-${index}`}
+                                    value={layer.direction}
+                                    onChange={(e) => updateWindLayer(index, 'direction', e.target.value)}
+                                    className="mt-1 block w-full rounded-md border-gray-300 shadow-sm sm:text-sm p-2"
+                                    min="0"
+                                    max="360"
+                                />
+                            </div>
+                            {/* Button to remove a wind layer */}
+                            <button
+                                onClick={() => removeWindLayer(index)}
+                                className="p-2 bg-red-500 text-white rounded-md hover:bg-red-600 focus:outline-none focus:ring-2 focus:ring-red-500 focus:ring-offset-2"
+                            >
+                                {/* SVG icon for delete */}
+                                <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor">
+                                    <path fillRule="evenodd" d="M9 2a1 1 0 00-.894.553L7.382 4H4a1 1 0 000 2v10a2 2 0 002 2h8a2 2 0 002-2V6a1 1 0 100-2h-3.382l-.724-1.447A1 1 0 0011 2H9zM7 8a1 1 0 011-1h4a1 1 0 110 2H8a1 1 0 01-1-1zm2 5a1 1 0 011-1h0a1 1 0 110 2h0a1 1 0 01-1-1z" clipRule="evenodd" />
+                                </svg>
+                            </button>
+                        </div>
+                    ))}
+                    {/* Button to add a new wind layer */}
+                    <button
+                        onClick={addWindLayer}
+                        className="w-full bg-indigo-600 text-white py-2 px-4 rounded-md hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:ring-offset-2 mt-4"
+                    >
+                        Add Wind Layer
+                    </button>
+                </div>
+
+                {/* Calculate Button */}
+                <button
+                    onClick={calculateGlideDistance}
+                    className="w-full bg-green-600 text-white font-bold py-3 px-4 rounded-md hover:bg-green-700 focus:outline-none focus:ring-2 focus:ring-green-500 focus:ring-offset-2 transition duration-150 ease-in-out"
+                    disabled={isLoading} // Disable button while calculating
+                >
+                    {isLoading ? (
+                        // Loading spinner and text
+                        <span className="flex items-center justify-center">
+                            <svg className="animate-spin -ml-1 mr-3 h-5 w-5 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                            </svg>
+                            Calculating...
+                        </span>
+                    ) : (
+                        'Calculate Glide Distance'
+                    )}
+                </button>
+
+                {/* Display Results for Specific Entered Direction */}
+                {specificDirectionResult && specificDirectionResult.speed !== null && (
+                    <div className="mt-8 p-6 bg-purple-50 rounded-lg shadow-inner text-center">
+                        <h2 className="text-2xl font-bold text-purple-800 mb-4">Results for Entered Direction ({specificDirectionResult.direction}° True)</h2>
+                        <p className="text-xl text-gray-800 mb-2">
+                            Optimal Speed: <span className="font-bold text-purple-700">{specificDirectionResult.speed.toFixed(1)} knots (IAS)</span>
+                        </p>
+                        <p className="text-xl text-gray-800 mb-2">
+                            Flight Distance: <span className="font-bold text-purple-700">{specificDirectionResult.distance.toFixed(2)} kilometers</span>
+                        </p>
+                        <p className="text-xl text-gray-800">
+                            Flight Time: <span className="font-bold text-purple-700">{specificDirectionResult.time.toFixed(1)} minutes</span>
+                        </p>
+                    </div>
+                )}
+
+
+                {/* Display Spider Graph */}
+                <h2 className="text-2xl font-bold text-center text-gray-800 mt-8 mb-4">Glide Distance by Direction (Spider Graph)</h2>
+                <SpiderGraph data={polarResults} desiredFlightDirection={desiredFlightDirection} /> {/* Pass desiredFlightDirection */}
+            </div>
+        </div>
+    );
+};
+
+export default App;
+</html>
